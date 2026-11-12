@@ -11315,6 +11315,66 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                            NULL, 0, NULL);
 }
 
+/* How a thinking-visible checkpoint serves the start of one request's prompt:
+ * the first `bytes` of the rendered prompt are the checkpoint's key and stand
+ * for `tokens` KV tokens, which also hold the reasoning the client does not
+ * replay.  It describes this request's prompt_text and lives no longer than
+ * the request: a base outliving its prompt could label a KV with a text it
+ * was not computed from. */
+typedef struct {
+    const char *prompt_text;
+    size_t prompt_len;
+    size_t bytes;
+    int tokens;
+} kv_visible_base;
+
+/* The disk key of a checkpoint cut while a prompt prefills on top of a visible
+ * base: the base's visible text plus the prompt text the tokens after it were
+ * tokenized from.  Rendering all the tokens instead spells out the hidden
+ * reasoning, a text no later prompt contains, so that entry is never loaded.
+ * `suffix` is the rendering of the tokens after the base; NULL when it is not
+ * the prompt text that follows the base, since the base then does not
+ * describe these tokens and must not name them. */
+static char *kv_visible_base_key_text(const kv_visible_base *base,
+                                      const char *suffix, size_t suffix_len) {
+    if (!base || !base->prompt_text || base->bytes == 0 ||
+        base->bytes > base->prompt_len) return NULL;
+    if (!byte_prefix_match(base->prompt_text + base->bytes,
+                           base->prompt_len - base->bytes, suffix, suffix_len))
+        return NULL;
+    return xstrndup(base->prompt_text, base->bytes + suffix_len);
+}
+
+/* Store a prefix of the prompt being prefilled.  With a visible base under it
+ * the entry is keyed by visible text, like the checkpoint it extends. */
+static bool kv_cache_store_prompt_prefix(server *s, server_slot *slot,
+                                         const ds4_tokens *tokens,
+                                         int store_len, const char *reason,
+                                         const kv_visible_base *base) {
+    if (!s || !base || !tokens || store_len < base->tokens ||
+        store_len > tokens->len || store_len < s->kv.opt.min_tokens)
+        return kv_cache_store_live_prefix(s, slot, tokens, store_len, reason);
+    const ds4_tokens suffix = {
+        .v = tokens->v + base->tokens,
+        .len = store_len - base->tokens,
+    };
+    size_t suffix_len = 0;
+    char *rendered = render_tokens_text(s->engine, &suffix, &suffix_len);
+    char *key = kv_visible_base_key_text(base, rendered, suffix_len);
+    free(rendered);
+    if (!key) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache visible base does not cover tokens=%d reason=%s base=%d; keyed by token text",
+                   store_len, reason, base->tokens);
+        return kv_cache_store_live_prefix(s, slot, tokens, store_len, reason);
+    }
+    bool ok = kv_cache_store_live_prefix_text(s, slot, tokens, store_len, reason,
+                                              key, KV_EXT_THINKING_VISIBLE,
+                                              "thinking-visible");
+    free(key);
+    return ok;
+}
+
 static void kv_cache_store_current(server *s, server_slot *slot,
                                    const char *reason) {
     if (!s || !slot) return;
@@ -11422,14 +11482,17 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->inference_mu);
 }
 
-static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
+/* `base` is the visible base of the prompt being prefilled; NULL once the
+ * model is generating, since sampled tokens are not prompt text. */
+static void kv_cache_maybe_store_continued(server *s, server_slot *slot,
+                                           const kv_visible_base *base) {
     if (!s || !slot) return;
     kv_disk_cache *kc = &s->kv;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
     const int target = kv_cache_slot_continued_target(s, slot, tokens->len);
     if (target == 0) return;
-    if (kv_cache_store_live_prefix(s, slot, tokens, target, "continued")) {
+    if (kv_cache_store_prompt_prefix(s, slot, tokens, target, "continued", base)) {
         (void)kc;
         kv_cache_slot_note_store(slot, target);
     }
@@ -11447,10 +11510,12 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
+                                  size_t *loaded_text_bytes_out,
                                   bool responses_protocol) {
     if (!s || !slot) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    if (loaded_text_bytes_out) *loaded_text_bytes_out = 0;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
@@ -11469,6 +11534,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     if (loaded > 0) {
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
+        if (loaded_text_bytes_out) *loaded_text_bytes_out = lr.text_bytes;
     }
     ds4_kvstore_load_result_free(&lr);
     return loaded;
@@ -11477,11 +11543,13 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
 static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
-                             uint8_t *loaded_ext_flags_out) {
+                             uint8_t *loaded_ext_flags_out,
+                             size_t *loaded_text_bytes_out) {
     return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
                                   effective_prompt,
                                   loaded_path_out,
                                   loaded_ext_flags_out,
+                                  loaded_text_bytes_out,
                                   req && req->api == API_RESPONSES);
 }
 
@@ -11516,7 +11584,7 @@ static int kv_cache_try_load_image_prefix(server *s, server_slot *slot,
     if (bytes == 0) return 0;
     char *text = xstrndup(req->prompt_text, bytes);
     int loaded = kv_cache_try_load_text(s, slot, text, NULL, loaded_path_out,
-                                        loaded_ext_flags_out,
+                                        loaded_ext_flags_out, NULL,
                                         req->api == API_RESPONSES);
     free(text);
     if (loaded <= 0) return 0;
@@ -12192,6 +12260,7 @@ typedef struct {
     bool stream_failed;
     double last_keepalive;
     job *request_job;
+    const kv_visible_base *visible_base;
 } server_prefill_progress;
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
@@ -12788,7 +12857,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && p->slot && current > p->cached_tokens) {
-            kv_cache_maybe_store_continued(p->srv, p->slot);
+            kv_cache_maybe_store_continued(p->srv, p->slot, p->visible_base);
         }
         return;
     }
@@ -12829,7 +12898,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                avg_tps,
                elapsed);
     if (p->srv && p->slot && current > p->cached_tokens) {
-        kv_cache_maybe_store_continued(p->srv, p->slot);
+        kv_cache_maybe_store_continued(p->srv, p->slot, p->visible_base);
     }
 }
 
@@ -13128,7 +13197,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, slot,
                                             rendered.ptr ? rendered.ptr : "",
-                                            &effective, &path, NULL, false);
+                                            &effective, &path, NULL, NULL, false);
         if (loaded == 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_invalidate(slot->session);
@@ -13667,6 +13736,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     int disk_cached = 0;
     char *disk_cache_path = NULL;
     uint8_t disk_cache_ext_flags = 0;
+    size_t disk_cache_text_bytes = 0;
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d vision=%s reason=%s",
@@ -13693,7 +13763,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!multimodal && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path,
-                                        &disk_cache_ext_flags);
+                                        &disk_cache_ext_flags,
+                                        &disk_cache_text_bytes);
         if (disk_cached > 0) {
             cached = disk_cached;
             cache_source = "disk-text";
@@ -13706,6 +13777,26 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         if (disk_cached > 0) {
             cached = disk_cached;
             cache_source = "disk-text";
+        }
+    }
+    /* A thinking-visible checkpoint under this prompt, live or from disk: the
+     * prefixes stored while the rest prefills are keyed through it. */
+    kv_visible_base visible_base = {0};
+    const kv_visible_base *store_base = NULL;
+    if (!multimodal && cached > 0 && j->req.kind == REQ_CHAT &&
+        j->req.api == API_OPENAI && j->req.prompt_text)
+    {
+        if (thinking_live_continuation) {
+            visible_base.bytes = reuse.suffix_off;
+        } else if (disk_cached > 0 &&
+                   (disk_cache_ext_flags & KV_EXT_THINKING_VISIBLE)) {
+            visible_base.bytes = disk_cache_text_bytes;
+        }
+        if (visible_base.bytes > 0) {
+            visible_base.prompt_text = j->req.prompt_text;
+            visible_base.prompt_len = strlen(j->req.prompt_text);
+            visible_base.tokens = cached;
+            store_base = &visible_base;
         }
     }
     const bool responses_reasoning_state_preserved =
@@ -13743,6 +13834,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         .stream = j->req.stream,
         .enable_cors = s->enable_cors,
         .request_job = j,
+        .visible_base = store_base,
     };
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
     char req_flags[64];
@@ -13858,8 +13950,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
         }
-        if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
-                                       cold_store_len, "cold")) {
+        if (kv_cache_store_prompt_prefix(s, slot, prompt_for_sync,
+                                         cold_store_len, "cold", store_base)) {
             kv_cache_slot_note_store(slot, cold_store_len);
             suppressed_continued_last = -1;
         } else {
@@ -13908,7 +14000,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
-    if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+    if (!multimodal) kv_cache_maybe_store_continued(s, slot, store_base);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -13917,8 +14009,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                req_flags,
                now_sec() - t0);
     if (cold_store_len == prompt_for_sync->len) {
-        if (!multimodal && kv_cache_store_live_prefix(s, slot, prompt_for_sync,
-                                       cold_store_len, "cold")) {
+        if (!multimodal && kv_cache_store_prompt_prefix(s, slot, prompt_for_sync,
+                                       cold_store_len, "cold", store_base)) {
             kv_cache_slot_note_store(slot, cold_store_len);
             suppressed_continued_last = -1;
         } else {
@@ -14047,7 +14139,7 @@ decode_again:
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+            if (!multimodal) kv_cache_maybe_store_continued(s, slot, NULL);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -21964,6 +22056,112 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     rmdir(dir);
 }
 
+static void test_kv_visible_base_key_text_follows_prompt_text(void) {
+    /* A checkpoint whose KV holds a reply's reasoning, keyed by the text the
+     * client replays; the request continues that text. */
+    const char *checkpoint =
+        "<｜User｜>first<｜Assistant｜></think>answer<｜end▁of▁sentence｜>";
+    const char *tail = "<｜User｜>result rows<｜Assistant｜><think>";
+    buf prompt = {0};
+    buf_puts(&prompt, checkpoint);
+    buf_puts(&prompt, tail);
+    kv_visible_base base = {
+        .prompt_text = prompt.ptr,
+        .prompt_len = prompt.len,
+        .bytes = strlen(checkpoint),
+        .tokens = 600,
+    };
+
+    const char *cut = "<｜User｜>result";
+    char *key = kv_visible_base_key_text(&base, cut, strlen(cut));
+    TEST_ASSERT(key != NULL);
+    TEST_ASSERT(key && strlen(key) == strlen(checkpoint) + strlen(cut));
+    TEST_ASSERT(key && !strncmp(key, prompt.ptr, strlen(key)));
+    free(key);
+
+    /* A cut at the base itself is the checkpoint's own key. */
+    key = kv_visible_base_key_text(&base, "", 0);
+    TEST_ASSERT(key && !strcmp(key, checkpoint));
+    free(key);
+
+    key = kv_visible_base_key_text(&base, tail, strlen(tail));
+    TEST_ASSERT(key && !strcmp(key, prompt.ptr));
+    free(key);
+
+    /* Tokens that are not the prompt text after the base get no visible key:
+     * other text, text running past the prompt, a base beyond the prompt. */
+    const char *other = "<｜User｜>resulT";
+    TEST_ASSERT(kv_visible_base_key_text(&base, other, strlen(other)) == NULL);
+    buf longer = {0};
+    buf_puts(&longer, tail);
+    buf_puts(&longer, "sampled");
+    TEST_ASSERT(kv_visible_base_key_text(&base, longer.ptr, longer.len) == NULL);
+    buf_free(&longer);
+    base.bytes = prompt.len + 1;
+    TEST_ASSERT(kv_visible_base_key_text(&base, "", 0) == NULL);
+    base.bytes = 0;
+    TEST_ASSERT(kv_visible_base_key_text(&base, cut, strlen(cut)) == NULL);
+    TEST_ASSERT(kv_visible_base_key_text(NULL, cut, strlen(cut)) == NULL);
+    buf_free(&prompt);
+}
+
+static void test_kv_visible_base_key_is_found_by_replayed_history(void) {
+    char tmpl[] = "/tmp/ds4-kv-visible-base-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *checkpoint =
+        "<｜User｜>first<｜Assistant｜></think>answer<｜end▁of▁sentence｜>";
+    const char *turn = "<｜User｜>call<｜Assistant｜></think>done<｜end▁of▁sentence｜>";
+    buf preheat = {0}, next = {0}, tokens_text = {0};
+    buf_puts(&preheat, checkpoint);
+    buf_puts(&preheat, turn);
+    buf_puts(&preheat, "<｜User｜> <｜Assistant｜><think>");
+    buf_puts(&next, checkpoint);
+    buf_puts(&next, turn);
+    buf_puts(&next, "<｜User｜>the next question<｜Assistant｜><think>");
+    /* What rendering the KV's tokens gives: the first reply with its reasoning. */
+    buf_puts(&tokens_text, "<｜User｜>first<｜Assistant｜><think>hidden</think>answer<｜end▁of▁sentence｜>");
+    buf_puts(&tokens_text, turn);
+
+    kv_visible_base base = {
+        .prompt_text = preheat.ptr,
+        .prompt_len = preheat.len,
+        .bytes = strlen(checkpoint),
+        .tokens = 600,
+    };
+    char *key = kv_visible_base_key_text(&base, turn, strlen(turn));
+    TEST_ASSERT(key != NULL);
+    if (!key) key = xstrdup(checkpoint);
+    test_kv_text_stub_file(dir, checkpoint, KV_REASON_EVICT, 600, 0);
+    test_kv_text_stub_file(dir, key, KV_REASON_COLD, 700, 0);
+    test_kv_text_stub_file(dir, tokens_text.ptr, KV_REASON_COLD, 701, 0);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    int idx = kv_cache_find_text_prefix(&kc, next.ptr, 2, 32768);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 700);
+    kv_cache_close(&kc);
+
+    const char *texts[] = {checkpoint, key, tokens_text.ptr};
+    for (int i = 0; i < 3; i++) {
+        char sha[41], name[44];
+        sha1_bytes_hex(texts[i], strlen(texts[i]), sha);
+        snprintf(name, sizeof(name), "%.40s.kv", sha);
+        char *path = path_join(dir, name);
+        unlink(path);
+        free(path);
+    }
+    rmdir(dir);
+    free(key);
+    buf_free(&preheat);
+    buf_free(&next);
+    buf_free(&tokens_text);
+}
+
 static void test_kv_cache_lookup_rejects_wrong_model(void) {
     char tmpl[] = "/tmp/ds4-kv-model-id-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -23317,6 +23515,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
+    test_kv_visible_base_key_text_follows_prompt_text();
+    test_kv_visible_base_key_is_found_by_replayed_history();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
